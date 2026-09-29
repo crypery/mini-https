@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mini-c-server&mdash; Demo</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#4ade80; --err:#f87171; }
+  * { box-sizing:border-box; }
+  body { font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  h2 { font-size:17px; margin:0 0 12px; color:var(--accent); }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:16px; max-width:1100px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  button { background:var(--accent); color:#04121f; border:none; border-radius:6px; padding:7px 14px; font-size:13px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#334155; color:var(--text); }
+  button.danger { background:#7f1d1d; color:#fecaca; }
+  input[type=text], input[type=file] { background:#0f172a; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-size:13px; width:100%; }
+  textarea, pre { background:#0f172a; color:#cbd5e1; border:1px solid var(--border); border-radius:6px; padding:10px; font-family:Consolas,monospace; font-size:12px; width:100%; resize:vertical; }
+  textarea { height:140px; }
+  pre { min-height:120px; overflow:auto; margin:0; }
+  .status { font-size:12px; color:var(--muted); margin-bottom:8px; }
+  .status.ok { color:var(--ok); }
+  .status.err { color:var(--err); }
+  .notice { border-left:3px solid var(--accent); background:#0f172a; padding:8px 10px; font-size:13px; border-radius:0 6px 6px 0; margin-bottom:10px; }
+  code { background:#0f172a; padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>mini-c-server</h1>
+  <div class="sub">HTTP/1.1 + HTTPS + WebSocket + SSE + multipart upload, written in C (select() + thread pool). All endpoints below are live.</div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>GET /api/info</h2>
+      <p class="status">Server statistics and your request headers, returned as JSON.</p>
+      <div class="row">
+        <button onclick="fetchInfo()">Fetch /api/info</button>
+        <button class="secondary" onclick="document.getElementById('info').textContent=''">Clear</button>
+      </div>
+      <pre id="info">Click the button to load server info.</pre>
+    </section>
+
+    <section class="card">
+      <h2>GET /ws &mdash; Live Server Logs</h2>
+      <p class="status">WebSocket streams every server log line into the box below. Try opening the other buttons/tabs &mdash; you will see their requests appear here in real time.</p>
+      <div class="row">
+        <button id="wsConnectBtn" onclick="wsConnect()">Connect</button>
+        <button class="secondary" onclick="wsSend()">Send "ping"</button>
+        <button class="danger" id="wsDisconnectBtn" onclick="wsDisconnect()" style="display:none">Disconnect</button>
+      </div>
+      <textarea id="wsLog" readonly spellcheck="false">[logs will appear here]</textarea>
+    </section>
+
+    <section class="card">
+      <h2>GET /sse &mdash; Notifications</h2>
+      <p class="status">Server-Sent Events push <code>connected</code> and <code>tick</code> events.</p>
+      <div class="row">
+        <button onclick="sseStart()">Start SSE</button>
+        <button class="secondary" onclick="sseStop()">Stop SSE</button>
+      </div>
+      <pre id="sseBox">SSE is stopped.</pre>
+    </section>
+
+    <section class="card">
+      <h2>POST /api/upload</h2>
+      <p class="status">Uploads a file (multipart/form-data) to the <code>upload_dir</code> configured in config.json.</p>
+      <div class="row">
+        <input type="file" id="fileInput">
+        <button onclick="uploadFile()">Upload</button>
+      </div>
+      <pre id="uploadResult">Select a file and upload it.</pre>
+    </section>
+
+    <section class="card">
+      <h2>POST /api/form</h2>
+      <p class="status">Sends the text <code>HelloWorld!</code> as the raw request body; the server echoes it back as the message.</p>
+      <div class="row">
+        <button onclick="sendForm()">Send "HelloWorld!"</button>
+      </div>
+      <pre id="formResult">Nothing sent yet.</pre>
+    </section>
+  </div>
+
+<script>
+  // --- GET /api/info ---
+  async function fetchInfo() {
+    const pre = document.getElementById('info');
+    pre.textContent = 'Loading...';
+    try {
+      const res = await fetch('/api/info');
+      const text = await res.text();
+      try { pre.textContent = JSON.stringify(JSON.parse(text), null, 2); }
+      catch { pre.textContent = text; }
+    } catch (e) { pre.textContent = 'Error: ' + e.message; }
+  }
+
+  // --- WebSocket live logs ---
+  let ws = null;
+  const wsLogEl = document.getElementById('wsLog');
+
+  function wsConnect() {
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const url = proto + location.host + '/ws';
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+      wsLogEl.value += '>>> connected to ' + url + '\n';
+      wsLogEl.scrollTop = wsLogEl.scrollHeight;
+      document.getElementById('wsConnectBtn').style.display = 'none';
+      document.getElementById('wsDisconnectBtn').style.display = '';
+    };
+    ws.onmessage = (ev) => {
+      wsLogEl.value += ev.data;
+      wsLogEl.scrollTop = wsLogEl.scrollHeight;
+    };
+    ws.onclose = () => {
+      wsLogEl.value += '>>> disconnected\n';
+      document.getElementById('wsConnectBtn').style.display = '';
+      document.getElementById('wsDisconnectBtn').style.display = 'none';
+    };
+    ws.onerror = () => wsLogEl.value += '>>> connection error\n';
+  }
+
+  function wsSend() {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
+    else wsLogEl.value += '>>> not connected\n';
+  }
+
+  function wsDisconnect() {
+    if (ws) { ws.close(); ws = null; }
+  }
+
+  // --- SSE notifications ---
+  let es = null;
+  const sseBox = document.getElementById('sseBox');
+
+  function sseStart() {
+    if (es) sseStop();
+    sseBox.textContent = 'Connecting...';
+    es = new EventSource('/sse');
+    es.addEventListener('connected', (e) => {
+      sseBox.textContent = 'connected event: ' + e.data + '\n';
+    });
+    es.addEventListener('tick', (e) => {
+      sseBox.textContent += 'tick event: ' + e.data + '\n';
+      sseBox.scrollTop = sseBox.scrollHeight;
+    });
+    es.onerror = () => { sseBox.textContent += 'error: connection dropped\n'; };
+  }
+
+  function sseStop() {
+    if (es) { es.close(); es = null; }
+    sseBox.textContent += 'SSE stopped.\n';
+  }
+
+  // --- Upload ---
+  async function uploadFile() {
+    const input = document.getElementById('fileInput');
+    const pre = document.getElementById('uploadResult');
+    if (!input.files.length) { pre.textContent = 'Choose a file first.'; return; }
+    const fd = new FormData();
+    fd.append('file', input.files[0]);
+    try {
+      const res = await fetch('/api/upload', { method: 'POST', body: fd });
+      pre.textContent = await res.text();
+    } catch (e) { pre.textContent = 'Error: ' + e.message; }
+  }
+
+  // --- Form echo ---
+  async function sendForm() {
+    const pre = document.getElementById('formResult');
+    try {
+      const res = await fetch('/api/form', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: 'HelloWorld!'
+      });
+      pre.textContent = 'Response: ' + await res.text();
+    } catch (e) { pre.textContent = 'Error: ' + e.message; }
+  }
+</script>
+</body>
+</html>

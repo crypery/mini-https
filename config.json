@@ -1,0 +1,23 @@
+{
+    "ssl_use": true,
+    "port": 443,
+    "root": "www",
+    "upload_dir": "www/upload",
+    "cert_file": "localhost.crt",
+    "key_file": "localhost.key",
+    "max_clients": 1024,
+    "timeout_io": 5000,
+    "timeout_handshake": 5000,
+    "timeout_tls_poll": 500,
+    "timeout_flight": 5000,
+    "timeout_accept": 1000,
+    "worker_threads": 64,
+    "max_body_mb": 0,
+    "log_file": "server.log",
+    "log_output": 2,
+    "log_level": 3,
+    "server_name": "nginx/1.25.2",
+    "domains": "localhost,127.0.0.1",
+    "www_redirect": true
+}
+
