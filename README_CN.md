@@ -58,13 +58,13 @@ build_web.bat
 
 该脚本编译项目并生成 `server.exe`（全功能服务器）。
 
-### 构建并运行单元测试
+### 构建测试工具
 
 ```bat
 build_test.bat
 ```
 
-该脚本构建 `ssl_test.exe` 并**针对正在运行的服务器**执行测试（默认 `https 127.0.0.1 443`，包含压力测试）。运行 `build_test.bat` 之前必须先启动服务器。
+该脚本构建 `web_test.exe`，一个**针对正在运行的服务器**执行单元测试和压力测试的测试工具（见 `测试 (web_test.c)` 一节）。运行 `web_test.exe` 之前必须先启动 `server.exe` / `server-base.exe`。
 
 ## 使用
 
@@ -137,24 +137,47 @@ curl -k -i -H "Host: www.localhost" https://127.0.0.1/
 :: -> HTTP/1.1 301 Moved Permanently, Location: https://localhost/
 ```
 
-## 单元测试
+## 测试（`web_test.c`）
 
-测试针对已启动的服务器执行：
+`web_test.c` 是一个独立的测试工具，针对**正在运行的**服务器执行**单元测试**和**压力测试**。它可以针对 `server-base.exe`（仅静态文件）或 `server.exe`（静态文件 + API + WS + SSE + 上传），通过纯 HTTP 或 TLS 运行。每个检查项都会打印 `[PASS]`/`[FAIL]` 以及收到的状态码；最后会打印汇总和所有响应码的直方图。
+
+必须先启动服务器，并且 `base`/`web` 与 `http`/`https` 参数要与你启动的服务器及其 `config.json` 相匹配：
 
 ```bat
-:: 1. 启动服务器
-server.exe
+:: 1. 启动服务器（在一个终端中）
+server.exe            :: 或 server-base.exe
 
 :: 2. 在另一个终端中构建并运行测试
 build_test.bat
+web_test.exe <base|web> <http|https> <host> <port> [unit|stress|all]
+
+:: 示例
+web_test.exe base https 127.0.0.1 443 all     :: server-base，TLS，单元测试 + 压力测试
+web_test.exe web  https 127.0.0.1 443 unit    :: server，    TLS，仅单元测试
+web_test.exe base http  127.0.0.1 8443 stress :: server-base，纯 HTTP，仅压力测试
 ```
 
-`ssl_test.exe` 的可用运行模式：
+### 单元测试
 
-```bat
-ssl_test.exe https 127.0.0.1 443:: TLS 单元测试
-ssl_test.exe http 127.0.0.1 8443:: HTTP 单元测试
-ssl_test.exe https 127.0.0.1 443 stress:: + 压力测试（并发请求、连接风暴）
-```
+- **静态文件** - `GET /` 和 `GET /index.html` -> `200`，不存在的页面 -> `404`，`POST /`（忽略请求体）-> `200`
+- **gzip** - 创建预压缩的 `www/index.html.gz`，检查 `Content-Encoding: gzip` 和 `1f 8b` 魔数，然后删除该文件
+- **错误路径** - 畸形请求、`../` 路径穿越 -> `400`、被阻止的路径（`config.json`）-> `403`、不允许的 `Host` -> `400`、`www.` 主机 -> `301` 重定向、约 10 KB 的请求头 -> `431`、3 KB 长的 URI -> `414`/`404`（不崩溃）
+- **请求体大小限制** - `Content-Length: 300000000` -> `413`（硬性上限），处理负的 `Content-Length`
+- **Web API**（仅 server）- `GET /api/info`（JSON）、`GET /api/hello?name=`（问候语）以及缺少 `name` -> `400`、`GET /api/params`（解析后的 HTML）、`POST /api/echo`（JSON 回显）
+- **表单与上传**（仅 server）- `POST /api/form` urlencoded 和 multipart；`POST /api/upload` multipart（文件保存到 `www/upload` 并在磁盘上校验），非 multipart 上传 -> `400`
+- **WebSocket**（仅 server）- `GET /ws` -> `101` 且 `Sec-WebSocket-Accept` 正确（用独立的 SHA-1 + base64 校验）、文本帧回显、关闭帧
+- **SSE**（仅 server）- `GET /sse` -> `200` `text/event-stream`，包含 `connected` + `tick` 事件
+- **无 API 检查**（仅 server-base）- `GET /api/info` 和 `POST /api/echo` -> `404`
+- **TLS 健壮性**（仅 HTTPS）- 非法记录类型/版本、仅 ChangeCipherSpec、TLS alert、小的应用数据记录、合法/非法记录混合、>16 KB 记录、构造的 ClientHello；在 TLS 端口发送明文请求 -> `426` 或干净地关闭连接（全部有界，不占用工作线程）
 
-每个测试都会打印收到的 HTTP 状态码：`0` - 连接未建立，`1` - 连接已建立但未收到状态码，`2xx/3xx/4xx/5xx` - 服务器响应码。
+### 压力测试
+
+- **快速** - 30 个顺序请求
+- **并发** - 8 个线程 x 10 个请求
+- **1 MB 上传** - 大请求体，发往 `/api/upload`（server）或 `/`（base）
+- **空闲 + 中断风暴** - 大量空闲连接和突然关闭的连接，随后进行健康检查（服务器必须保持响应）
+- **Slowloris 滴漏** - 每 2 秒发送 1 个字节，使请求头阶段超过服务器超时；服务器必须返回 `408` 并释放工作线程
+
+### 输出
+
+每个测试都会打印收到的状态码：`0` - 连接未建立，`1` - 连接已建立但未收到状态码，`2xx/3xx/4xx/5xx` - 服务器响应码。

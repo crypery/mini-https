@@ -58,13 +58,13 @@ build_web.bat
 
 The script compiles the project and produces `server.exe` (full-featured server).
 
-### Building and running unit tests
+### Building the test harness
 
 ```bat
 build_test.bat
 ```
 
-The script builds `ssl_test.exe` and runs the tests **against a running server** (default `https 127.0.0.1 443`, including stress tests). The server must be started before running `build_test.bat`.
+The script builds `web_test.exe`, a test harness that runs unit and stress tests **against a running server** (see the `Testing (web_test.c)` section). Start `server.exe` / `server-base.exe` before running `web_test.exe`.
 
 ## Usage
 
@@ -137,24 +137,47 @@ curl -k -i -H "Host: www.localhost" https://127.0.0.1/
 :: -> HTTP/1.1 301 Moved Permanently, Location: https://localhost/
 ```
 
-## Unit Tests
+## Testing (`web_test.c`)
 
-The tests run against a started server:
+`web_test.c` is a standalone test harness that runs **unit** and **stress** tests against a **running** server. It can target either `server-base.exe` (static only) or `server.exe` (static + API + WS + SSE + upload), over plain HTTP or TLS. Each check prints `[PASS]`/`[FAIL]` and the status code it received; a summary and a histogram of all response codes are printed at the end.
+
+The server must be started first, and the `base`/`web` and `http`/`https` arguments must match the server you started and its `config.json`:
 
 ```bat
-:: 1. Start the server
-server.exe
+:: 1. Start the server (in one terminal)
+server.exe            :: or server-base.exe
 
 :: 2. In another terminal - build and run the tests
 build_test.bat
+web_test.exe <base|web> <http|https> <host> <port> [unit|stress|all]
+
+:: Examples
+web_test.exe base https 127.0.0.1 443 all     :: server-base, TLS, unit + stress
+web_test.exe web  https 127.0.0.1 443 unit    :: server,     TLS, unit only
+web_test.exe base http  127.0.0.1 8443 stress :: server-base, plain HTTP, stress only
 ```
 
-Available `ssl_test.exe` run modes:
+### Unit tests
 
-```bat
-ssl_test.exe https 127.0.0.1 443:: TLS unit tests
-ssl_test.exe http 127.0.0.1 8443:: HTTP unit tests
-ssl_test.exe https 127.0.0.1 443 stress:: + stress tests (parallel requests, connection storm)
-```
+- **Static files** - `GET /` and `GET /index.html` -> `200`, missing page -> `404`, `POST /` (body ignored) -> `200`
+- **gzip** - creates a pre-compressed `www/index.html.gz`, checks `Content-Encoding: gzip` and the `1f 8b` magic bytes, then removes it
+- **Error paths** - malformed request, `../` traversal -> `400`, blocked path (`config.json`) -> `403`, disallowed `Host` -> `400`, `www.` host -> `301` redirect, ~10 KB of headers -> `431`, 3 KB-long URI -> `414`/`404` (no crash)
+- **Body limits** - `Content-Length: 300000000` -> `413` (hard cap), negative `Content-Length` handled
+- **Web API** *(server only)* - `GET /api/info` (JSON), `GET /api/hello?name=` (greeting) and missing `name` -> `400`, `GET /api/params` (parsed HTML), `POST /api/echo` (JSON echo)
+- **Forms and upload** *(server only)* - `POST /api/form` urlencoded and multipart; `POST /api/upload` multipart (file saved to `www/upload` and verified on disk), non-multipart upload -> `400`
+- **WebSocket** *(server only)* - `GET /ws` -> `101` with a correct `Sec-WebSocket-Accept` (checked with an independent SHA-1 + base64), text-frame echo, close frame
+- **SSE** *(server only)* - `GET /sse` -> `200` `text/event-stream` with `connected` + `tick` events
+- **No-API check** *(server-base only)* - `GET /api/info` and `POST /api/echo` -> `404`
+- **TLS robustness** *(HTTPS only)* - invalid record type / version, ChangeCipherSpec-only, TLS alert, small app-data records, mixed valid/invalid records, >16 KB record, crafted ClientHello; plaintext request on a TLS port -> `426` or a clean close (all bounded, no pinned worker)
 
-Each test prints the HTTP status it received: `0` - connection was not established, `1` - connection established but no status received, `2xx/3xx/4xx/5xx` - the server's response code.
+### Stress tests
+
+- **Rapid** - 30 sequential requests
+- **Concurrent** - 8 threads x 10 requests
+- **1 MB upload** - large body to `/api/upload` (server) or `/` (base)
+- **Idle + abort storm** - many idle and abruptly closed connections, then a health check (the server must stay responsive)
+- **Slowloris trickle** - the request is sent 1 byte every 2 s so the header phase exceeds the server deadline; the server must answer `408` and free the worker
+
+### Output
+
+Each test prints the status it received: `0` - connection was not established, `1` - connection established but no status received, `2xx/3xx/4xx/5xx` - the server's response code.

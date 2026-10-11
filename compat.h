@@ -7,7 +7,7 @@
 /*
  * compat.h - portability layer for the mini-c-server modules.
  *
- * Lets log, sett, server, and ssl_test compile and run on both
+ * Lets log, sett, server, and web_test compile and run on both
  * Windows (Winsock + WinAPI) and POSIX (Berkeley sockets + pthreads).
  *
  * On Windows the native APIs are used: SOCKET, WSA* errors, CRITICAL_SECTION,
