@@ -20,7 +20,11 @@
  * storm of silent speculative / aborted connections (accept-loop liveness).
  *
  * The <http|https> argument selects which set of unit tests to run
- * (plain HTTP vs TLS). Every test line reports its own response code:
+ * (plain HTTP vs TLS). Besides the TLS/HTTP protocol checks the harness
+ * also exercises the cookie API end-to-end via /api/cookie/set and
+ * /api/cookie/get (http_set_cookie / http_get_cookie), including malformed
+ * Cookie headers and invalid cookie name/value data.
+ * Every test line reports its own response code:
  *    0   - connection did NOT happen (TCP refused / TLS rejected / no response)
  *    1   - connection happened, but no HTTP status code was received
  *    2xx/3xx/4xx/5xx   - the HTTP Status Code received from the server
@@ -161,37 +165,117 @@ static int conn_read_http_status(TestConn *t, char *buf, int bufsz) {
     return t->status;
 }
 
-/* One complete HTTP(S) request. Returns observed status code. */
-static int http_request(int is_ssl,
-                        const char *method, const char *path,
-                        const char *content_type, const char *body, size_t body_len) {
+/* Parse the status code out of a response buffer (0 if none). */
+static int parse_http_status(const char *buf) {
+    const char *p = strstr(buf, "HTTP/");
+    if (!p) return 0;
+    p += 5;
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    int code = 0;
+    while (*p >= '0' && *p <= '9') { code = code * 10 + (*p - '0'); p++; }
+    return (code >= 100 && code <= 599) ? code : 0;
+}
+
+/* Value of a response header within the header block (NULL if absent). */
+static const char *find_resp_hdr(const char *resp, const char *key) {
+    const char *he = strstr(resp, "\r\n\r\n");
+    if (!he) return NULL;
+    size_t klen = strlen(key);
+    const char *p = resp;
+    while (p < he) {
+        const char *le = p;
+        while (le < he && *le != '\r') le++;
+        if ((size_t)(le - p) >= klen && _strnicmp(p, key, klen) == 0) {
+            const char *v = p + klen;
+            while (v < he && (*v == ' ' || *v == ':')) v++;
+            return v;
+        }
+        if (le >= he) break;
+        p = le + 2;
+    }
+    return NULL;
+}
+
+/* One complete HTTP(S) request with optional extra header lines. The raw
+ * response (headers + body up to Content-Length) is stored in resp when it is
+ * not NULL. Returns the observed status code (0 = no response). */
+static int http_request_ex(int is_ssl,
+                           const char *method, const char *path,
+                           const char *extra, const char *content_type,
+                           const char *body, size_t body_len,
+                           char *resp, int resp_sz) {
     TestConn t;
     if (conn_open(&t, is_ssl) != 0) { record_status(0); return 0; }
 
-    char req[8192];
+    char req[16384];
     int rl = snprintf(req, sizeof(req),
-        "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", method, path, g_host);
+        "%s %s HTTP/1.1\r\nHost: %s\r\n", method, path, g_host);
+    if (extra && extra[0])
+        rl += snprintf(req + rl, (size_t)(sizeof(req) - (size_t)rl), "%s", extra);
     if (body && body_len > 0) {
         if (content_type)
-            rl += snprintf(req + rl, (size_t)(sizeof(req) - rl),
-                "Content-Type: %s\r\nContent-Length: %d\r\n\r\n", content_type, (int)body_len);
+            rl += snprintf(req + rl, (size_t)(sizeof(req) - (size_t)rl),
+                "Content-Type: %s\r\nContent-Length: %llu\r\nConnection: close\r\n\r\n",
+                content_type, (unsigned long long)body_len);
         else
-            rl += snprintf(req + rl, (size_t)(sizeof(req) - rl), "Content-Length: %d\r\n\r\n", (int)body_len);
+            rl += snprintf(req + rl, (size_t)(sizeof(req) - (size_t)rl),
+                "Content-Length: %llu\r\nConnection: close\r\n\r\n", (unsigned long long)body_len);
+        if ((size_t)rl + body_len > sizeof(req)) { record_status(t.status); conn_close(&t); return t.status; }
         memcpy(req + rl, body, body_len);
         rl += (int)body_len;
     } else {
-        rl += snprintf(req + rl, (size_t)(sizeof(req) - rl), "\r\n");
+        rl += snprintf(req + rl, (size_t)(sizeof(req) - (size_t)rl), "Connection: close\r\n\r\n");
     }
     if (conn_send(&t, req, rl) <= 0) {
         record_status(t.status);
         conn_close(&t);
         return t.status;
     }
-    char resp[65536];
-    int code = conn_read_http_status(&t, resp, (int)sizeof(resp));
+
+    int at = 0, code = 0;
+    if (resp && resp_sz > 0) {
+        /* headers first ... */
+        while (at < resp_sz - 1) {
+            int n = conn_recv(&t, resp + at, resp_sz - 1 - at);
+            if (n <= 0) break;
+            at += n;
+            resp[at] = '\0';
+            if (strstr(resp, "\r\n\r\n")) break;
+        }
+        resp[at] = '\0';
+        code = parse_http_status(resp);
+        /* ... then the body up to Content-Length */
+        if (code > 0) {
+            const char *cl = find_resp_hdr(resp, "Content-Length:");
+            if (cl) {
+                long want = atol(cl);
+                const char *he = strstr(resp, "\r\n\r\n");
+                long have = he ? (long)(resp + at - (he + 4)) : 0;
+                while (have < want && at < resp_sz - 1) {
+                    int n = conn_recv(&t, resp + at, resp_sz - 1 - at);
+                    if (n <= 0) break;
+                    at += n;
+                    have += n;
+                }
+                resp[at] = '\0';
+            }
+        }
+    } else {
+        char tmp[4096];
+        code = conn_read_http_status(&t, tmp, (int)sizeof(tmp));
+    }
+    t.status = code;
     record_status(code);
     conn_close(&t);
     return code;
+}
+
+/* One complete HTTP(S) request (no extra headers). Returns observed status code. */
+static int http_request(int is_ssl,
+                        const char *method, const char *path,
+                        const char *content_type, const char *body, size_t body_len) {
+    return http_request_ex(is_ssl, method, path, NULL, content_type, body, body_len, NULL, 0);
 }
 
 /* ==================== HTTPS-only tests ==================== */
@@ -533,6 +617,89 @@ static void test_http_bad_request(void) {
     report(code == 400 || code == 404, "malformed request handled", code);
 }
 
+/* ==================== cookie tests (http_set_cookie / http_get_cookie) ==================== */
+
+/* Cookie round-trip through /api/cookie/set and /api/cookie/get, then a set
+ * of malformed cookie inputs: the server must parse every variant safely and
+ * reject invalid cookie names/values with 400. */
+static void test_cookies(int is_ssl) {
+    char resp[65536];
+    int code;
+    const char *tg = g_is_https ? "https" : "http";
+
+    printf("\n=== [%s] TEST: cookies (http_set_cookie / http_get_cookie) ===\n", tg);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/set?name=ctok&value=cv42",
+                           NULL, NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "Set-Cookie: ctok=cv42; Path=/"),
+           "set cookie -> Set-Cookie: ctok=cv42", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=ctok",
+                           "Cookie: ctok=cv42\r\n", NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"found\":true") && strstr(resp, "\"value\":\"cv42\""),
+           "get cookie (Cookie: ctok=cv42) -> found", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=ctok",
+                           NULL, NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"found\":false"),
+           "get cookie without Cookie header -> not found", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/set?name=ctok&value=new7",
+                           NULL, NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "Set-Cookie: ctok=new7; Path=/"),
+           "cookie update (same name, new value) -> Set-Cookie: ctok=new7", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=two",
+                           "Cookie: one=1; two=2\r\n", NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"value\":\"2\""),
+           "two cookies in one header -> second one read", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=ctok",
+                           "Cookie: ctok=a=b\r\n", NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"value\":\"a=b\""),
+           "cookie value containing '=' read in full", code);
+
+    printf("\n=== [%s] TEST: cookies - invalid data ===\n", tg);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=ctok",
+                           "Cookie: ctok\r\n", NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"found\":false"),
+           "Cookie pair without '=' handled (not found)", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=ctok",
+                           "Cookie: =cv42\r\n", NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"found\":false"),
+           "Cookie with empty name handled (not found)", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/get?name=ctok",
+                           "Cookie: ;;; ; \r\n", NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 200 && strstr(resp, "\"found\":false"),
+           "garbage Cookie header handled (not found)", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/set?name=&value=x",
+                           NULL, NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 400, "set cookie with empty name -> 400", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/set?name=a%3Bb&value=x",
+                           NULL, NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 400, "set cookie with ';' in name -> 400", code);
+
+    code = http_request_ex(is_ssl, "GET", "/api/cookie/set?name=ctok&value=a%3Bb",
+                           NULL, NULL, NULL, 0, resp, (int)sizeof(resp));
+    report(code == 400, "set cookie with ';' in value -> 400", code);
+
+    {
+        /* 9KB Cookie header: exceeds MAX_HEADER_SIZE (8192) -> 431 */
+        char extra[9300];
+        int off = (int)snprintf(extra, sizeof(extra), "Cookie: huge=");
+        memset(extra + off, 'a', 9000);
+        off += 9000;
+        extra[off++] = '\r'; extra[off++] = '\n';
+        code = http_request_ex(is_ssl, "GET", "/", extra, NULL, NULL, 0, resp, (int)sizeof(resp));
+        report(code == 431, "9KB Cookie header -> 431 (header limit)", code);
+    }
+}
+
 /* ==================== statistics ==================== */
 
 static void print_statistics(void) {
@@ -617,6 +784,8 @@ int main(int argc, char *argv[]) {
     }
 
     run_http_tests(g_is_https);
+
+    test_cookies(g_is_https);
 
     if (!g_is_https) {
         test_http_bad_request();

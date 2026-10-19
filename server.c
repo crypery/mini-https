@@ -42,44 +42,10 @@ int handle_get_sse(http_server_t *http, http_ctx_t *c, const char *method, const
 int handle_get_params(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len);
 /* POST /api/form - parse form data (urlencoded or multipart) */
 int handle_post_form(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len);
-
-/* --- WebSocket log broadcast --- */
-
-#define WS_MAX_CLIENTS 256
-
-/* Connected WebSocket client contexts (guarded by g_ws_lock) */
-static http_ctx_t *g_ws_clients[WS_MAX_CLIENTS];
-static int g_ws_count = 0;
-static mtx_t g_ws_lock;
-
-/* Register a connected WebSocket client */
-static void ws_register(http_ctx_t *c) {
-    mtx_lock(&g_ws_lock);
-    if (g_ws_count < WS_MAX_CLIENTS) g_ws_clients[g_ws_count++] = c;
-    mtx_unlock(&g_ws_lock);
-}
-
-/* Remove a disconnected WebSocket client */
-static void ws_unregister(http_ctx_t *c) {
-    mtx_lock(&g_ws_lock);
-    for (int i = 0; i < g_ws_count; i++) {
-        if (g_ws_clients[i] == c) {
-            g_ws_clients[i] = g_ws_clients[g_ws_count - 1];
-            g_ws_count--;
-            break;
-        }
-    }
-    mtx_unlock(&g_ws_lock);
-}
-
-/* Broadcast a log line to all connected WebSocket clients */
-static void ws_log_broadcast(const char *msg) {
-    mtx_lock(&g_ws_lock);
-    for (int i = 0; i < g_ws_count; i++) {
-        http_ws_send_text(g_ws_clients[i], msg);
-    }
-    mtx_unlock(&g_ws_lock);
-}
+/* GET /api/cookie/set - set a cookie in the response (http_set_cookie demo) */
+int handle_get_cookie_set(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len);
+/* GET /api/cookie/get - read a cookie from the request (http_get_cookie demo) */
+int handle_get_cookie_get(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len);
 
 /* --- helpers --- */
 
@@ -147,10 +113,10 @@ int handle_get_info(http_server_t *http, http_ctx_t *c, const char *method, cons
     char json[32768];
     snprintf(json, sizeof(json),
         "{\"server\":\"%s\",\"uptime_sec\":%.0f,\"requests\":%ld,"
-        "\"clients\":%d,\"ws_clients\":%d,\"upload_dir\":\"%s\",\"method\":\"%s\","
+        "\"clients\":%d,\"upload_dir\":\"%s\",\"method\":\"%s\","
         "\"features\":[\"POST\",\"WebSocket\",\"SSE\",\"MultipartUpload\",\"JSON\",\"QueryParams\"],"
         "\"headers\":%s}",
-        http->server_name, uptime, http->total_req, http->max_clients, g_ws_count,
+        http->server_name, uptime, http->total_req, http->max_clients,
         http->upload_dir ? http->upload_dir : "",method, hdr_json);
     http_send_json_response(http, c, 200, json);
     http_update_status_stats(http, 200);
@@ -244,7 +210,6 @@ int handle_post_upload(http_server_t *http, http_ctx_t *c, const char *method, c
 int handle_get_ws(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len) {
     (void)method; (void)uri; (void)body; (void)body_len;
     if (!http_ws_handshake(c, http_req_buf(c), c->rlen)) { http_send_json_response(http, c, 400, "{\"error\":\"WebSocket upgrade failed\"}"); return 1; }
-    ws_register(c);
     unsigned char rb[65536];
     size_t rlen = 0;
     int ws_active = 1;
@@ -268,33 +233,26 @@ int handle_get_ws(http_server_t *http, http_ctx_t *c, const char *method, const 
                 case HTTP_WS_OPCODE_TEXT: {
                     char json_resp[4096];
                     snprintf(json_resp, sizeof(json_resp), "{\"type\":\"echo\",\"data\":\"%.*s\"}", (int)frame.payload_len, frame.payload);
-                    mtx_lock(&g_ws_lock);
                     http_ws_send_text(c, json_resp);
-                    mtx_unlock(&g_ws_lock);
                     break;
                 }
                 case HTTP_WS_OPCODE_BINARY: {
                     char resp[4096];
                     snprintf(resp, sizeof(resp), "{\"type\":\"binary_echo\",\"size\":%d}", (int)frame.payload_len);
-                    mtx_lock(&g_ws_lock);
                     http_ws_send_text(c, resp);
-                    mtx_unlock(&g_ws_lock);
                     break;
                 }
                 case HTTP_WS_OPCODE_PING: {
-                    mtx_lock(&g_ws_lock);
                     http_ws_send_pong(c, frame.payload, frame.payload_len);
-                    mtx_unlock(&g_ws_lock);
                     break;
                 }
-                case HTTP_WS_OPCODE_CLOSE: { ws_active = 0; mtx_lock(&g_ws_lock); http_ws_send_close(c, 1000, "close"); mtx_unlock(&g_ws_lock); break; }
+                case HTTP_WS_OPCODE_CLOSE: { ws_active = 0; http_ws_send_close(c, 1000, "close"); break; }
             }
             processed += (size_t)frame_len;
         }
         if (processed > 0 && processed < rlen) memmove(rb, rb + processed, rlen - processed);
         rlen -= processed;
     }
-    ws_unregister(c);
     http_update_status_stats(http, 101);
     return 1;
 }
@@ -409,13 +367,73 @@ int handle_post_form(http_server_t *http, http_ctx_t *c, const char *method, con
     return 1;
 }
 
+/* GET /api/cookie/set?name=X&value=Y - set a cookie in the response.
+ * Demonstrates http_set_cookie(): the Set-Cookie header is queued onto the
+ * response. Invalid name/value (bad characters, empty name) -> 400. */
+int handle_get_cookie_set(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len) {
+    (void)method; (void)body; (void)body_len;
+    http_query_string_t qs;
+    http_query_init(&qs);
+    char clean_uri[2048];
+    strncpy(clean_uri, uri, sizeof(clean_uri) - 1);
+    clean_uri[sizeof(clean_uri) - 1] = '\0';
+    char *qs_start = strchr(clean_uri, '?');
+    if (qs_start) { *qs_start = '\0'; http_query_parse(&qs, qs_start + 1); }
+    const char *name = http_query_get(&qs, "name");
+    const char *value = http_query_get(&qs, "value");
+    if (!name || !name[0] || !value) {
+        http_query_destroy(&qs);
+        http_send_json_response(http, c, 400, "{\"error\":\"query parameters 'name' and 'value' are required\"}");
+        return 1;
+    }
+    if (http_set_cookie(http, c, name, value, "/", 3600, 0, 0) != 0) {
+        http_query_destroy(&qs);
+        http_send_json_response(http, c, 400, "{\"error\":\"invalid cookie name or value\"}");
+        return 1;
+    }
+    char nbuf[256], vbuf[1024], json[1536];
+    http_html_escape_str(nbuf, sizeof(nbuf), name);
+    http_html_escape_str(vbuf, sizeof(vbuf), value);
+    snprintf(json, sizeof(json), "{\"set\":true,\"name\":\"%s\",\"value\":\"%s\"}", nbuf, vbuf);
+    http_query_destroy(&qs);
+    http_send_json_response(http, c, 200, json);
+    http_update_status_stats(http, 200);
+    return 1;
+}
+
+/* GET /api/cookie/get?name=X - read the cookie X from the request Cookie
+ * header. Demonstrates http_get_cookie(). found:false when the Cookie header
+ * is absent or the cookie is not present in it. */
+int handle_get_cookie_get(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len) {
+    (void)method; (void)body; (void)body_len;
+    http_query_string_t qs;
+    http_query_init(&qs);
+    char clean_uri[2048];
+    strncpy(clean_uri, uri, sizeof(clean_uri) - 1);
+    clean_uri[sizeof(clean_uri) - 1] = '\0';
+    char *qs_start = strchr(clean_uri, '?');
+    if (qs_start) { *qs_start = '\0'; http_query_parse(&qs, qs_start + 1); }
+    const char *name = http_query_get(&qs, "name");
+    const char *val = name ? http_get_cookie(c, name) : NULL;
+    char nbuf[256], vbuf[1024], json[1536];
+    if (name) http_html_escape_str(nbuf, sizeof(nbuf), name);
+    if (val) http_html_escape_str(vbuf, sizeof(vbuf), val);
+    if (val)
+        snprintf(json, sizeof(json), "{\"found\":true,\"name\":\"%s\",\"value\":\"%s\"}", nbuf, vbuf);
+    else
+        snprintf(json, sizeof(json), "{\"found\":false,\"name\":\"%s\"}", name ? nbuf : "");
+    http_query_destroy(&qs);
+    http_send_json_response(http, c, 200, json);
+    http_update_status_stats(http, 200);
+    return 1;
+}
+
 /* --- Default config written when config.json is missing --- */
 
 static const char *sett_default =
     "{"
     "    \"ssl_use\": true,\n"
     "    \"port\": 81,\n"
-    "    \"root\": \"www\",\n"
     "    \"upload_dir\": \"www/upload\",\n"
     "    \"cert_file\": \"localhost.crt\",\n"
     "    \"key_file\": \"localhost.key\",\n"
@@ -431,7 +449,10 @@ static const char *sett_default =
     "    \"log_output\": 2,\n"
     "    \"log_level\": 3,\n"
     "    \"server_name\": \"nginx/1.25.2\",\n"
-    "    \"domains\": \"localhost,127.0.0.1\",\n"
+    "    \"domains\": {\n"
+    "        \"localhost\": \"www\",\n"
+    "        \"127.0.0.1\": \"www\"\n"
+    "    },\n"
     "    \"www_redirect\": true\n"
     "}\n";
 
@@ -503,9 +524,6 @@ int main(void) {
     http->log_level = sett_get_int(sett, "log_level", LOG_LEVEL_ERROR);
     if (http->log_level < LOG_LEVEL_DEBUG || http->log_level > LOG_LEVEL_ERROR) { LOG_ERROR("[err] log_level failed\n"); return 1; }
 
-    http->root = sett_get_string(sett, "root", "www");
-    if (!http->root || strlen(http->root)==0) { LOG_ERROR("[err] root failed\n"); return 1; }
-
     http->upload_dir = sett_get_string(sett, "upload_dir", DEF_UPLOAD_DIR);
     if (!http->upload_dir || strlen(http->upload_dir)==0) { LOG_ERROR("[err] upload_dir failed\n"); return 1; }
     ensure_dir(http->upload_dir);
@@ -522,26 +540,47 @@ int main(void) {
     http->server_name = sett_get_string(sett, "server_name", DEF_SERVER_NAME);
     if (!http->server_name || strlen(http->server_name)==0) { LOG_ERROR("[err] server_name failed\n"); return 1; }
 
-    http->domains = sett_get_string(sett, "domains", DEF_DOMAINS);
-    if (!http->domains || strlen(http->domains)==0) { LOG_ERROR("[err] domains failed\n"); return 1; }
+    /* Domains: a JSON object mapping "domain" -> "root path" (per-domain
+     * document roots). Logging is not initialized yet here, so errors go
+     * straight to stderr. */
+    {
+        JsonValue *dv = sett_get_json(sett, "domains");
+        if (!json_is_object(dv)) { fprintf(stderr, "[err] domains failed (expected an object: \"domain\": \"root path\")\n"); return 1; }
+        for (int i = 0; i < dv->count; i++) {
+            JsonValue *v = dv->children[i];
+            if (!dv->keys[i] || !json_is_string(v) || !json_string(v)[0]) {
+                fprintf(stderr, "[err] domains failed (\"%s\" root is not a non-empty string)\n", dv->keys[i] ? dv->keys[i] : "?");
+                return 1;
+            }
+            if (http_domain(http, dv->keys[i], json_string(v)) != 0) {
+                fprintf(stderr, "[err] domains failed (%s)\n", dv->keys[i]);
+                return 1;
+            }
+        }
+        if (http->domain_count == 0) { fprintf(stderr, "[err] domains failed (empty)\n"); return 1; }
+    }
 
     http->www_redirect = sett_get_bool(sett, "www_redirect", true) ? 1 : 0;
 
     log_init(http->log_output, http->log_level, http->log_file);
-    log_set_callback(ws_log_broadcast);
-    mtx_init(&g_ws_lock);
-    LOG_INFO("[main] config loaded (port=%d, ssl=%d, root=%s, upload=%s, max_body_mb=%d)\n",
-             http->port, http->ssl_use, http->root, http->upload_dir, http->max_body_mb);
+    LOG_INFO("[main] config loaded (port=%d, ssl=%d, upload=%s, max_body_mb=%d, domains=%d)\n",
+             http->port, http->ssl_use, http->upload_dir, http->max_body_mb, http->domain_count);
 
-    /* Register API routes */
-    http_route(http, "GET",  "/api/info",   handle_get_info);
-    http_route(http, "GET",  "/api/hello",  handle_get_hello);
-    http_route(http, "GET",  "/api/params", handle_get_params);
-    http_route(http, "GET",  "/ws",         handle_get_ws);
-    http_route(http, "GET",  "/sse",        handle_get_sse);
-    http_route(http, "POST", "/api/echo",   handle_post_echo);
-    http_route(http, "POST", "/api/upload", handle_post_upload);
-    http_route(http, "POST", "/api/form",   handle_post_form);
+    /* Register API routes for every configured domain (loop over the
+     * domains from config.json), before http_run() */
+    for (int i = 0; i < http->domain_count; i++) {
+        const char *d = http->domains[i].domain;
+        http_route(http, d, "GET",  "/api/info",   handle_get_info);
+        http_route(http, d, "GET",  "/api/hello",  handle_get_hello);
+        http_route(http, d, "GET",  "/api/params", handle_get_params);
+        http_route(http, d, "GET",  "/ws",         handle_get_ws);
+        http_route(http, d, "GET",  "/sse",        handle_get_sse);
+        http_route(http, d, "POST", "/api/echo",   handle_post_echo);
+        http_route(http, d, "POST", "/api/upload", handle_post_upload);
+        http_route(http, d, "POST", "/api/form",   handle_post_form);
+        http_route(http, d, "GET",  "/api/cookie/set", handle_get_cookie_set);
+        http_route(http, d, "GET",  "/api/cookie/get", handle_get_cookie_get);
+    }
 
     /* Start the server */
     if (http_run(http, http_log_cb) != 0) { LOG_ERROR("[err] http_run failed\n"); http_free(http); return 1; }
@@ -549,7 +588,6 @@ int main(void) {
     http_print_statistics(http);
 
     /* Clean up resources */
-    mtx_destroy(&g_ws_lock);
     http_free(http);
     log_close();
     sett_free(sett);

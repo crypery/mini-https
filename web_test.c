@@ -28,8 +28,9 @@
  *
  * Unit tests cover: static serving, gzip, 404/400/403/413/414/431/426/301,
  * path traversal, blocked paths, Host validation, www-redirect, JSON API,
- * forms, multipart upload, WebSocket (handshake accept value + echo + close),
- * SSE events, and malformed TLS records.
+ * cookies (set/read/update + malformed Cookie headers and invalid
+ * name/value data), forms, multipart upload, WebSocket (handshake accept
+ * value + echo + close), SSE events, and malformed TLS records.
  *
  * Stress tests cover: rapid sequential requests, threaded concurrent load,
  * lying Content-Length (body-limit enforcement), large uploads, a
@@ -664,6 +665,76 @@ static void test_web_api(void) {
     }
 }
 
+/* ==================== unit tests: server (cookies) ==================== */
+
+/* Cookie round-trip through the /api/cookie/set and /api/cookie/get routes
+ * (http_set_cookie / http_get_cookie) plus malformed cookie data: the server
+ * must parse every variant safely and reject invalid names/values. */
+static void test_web_cookies(void) {
+    char buf[16384];
+    int code;
+
+    printf("\n=== [%s] UNIT: cookies (http_set_cookie / http_get_cookie) ===\n", tag());
+
+    code = do_request(g_is_https, "GET", "/api/cookie/set?name=ctok&value=cv42", NULL, NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "Set-Cookie: ctok=cv42; Path=/"),
+           "GET /api/cookie/set -> Set-Cookie: ctok=cv42", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=ctok", "Cookie: ctok=cv42\r\n", NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"found\":true") && strstr(buf, "\"value\":\"cv42\""),
+           "GET /api/cookie/get (Cookie: ctok=cv42) -> found", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=ctok", NULL, NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"found\":false"),
+           "GET /api/cookie/get without Cookie header -> not found", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/set?name=ctok&value=new7", NULL, NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "Set-Cookie: ctok=new7; Path=/"),
+           "cookie update (same name, new value) -> Set-Cookie: ctok=new7", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=two", "Cookie: one=1; two=2\r\n", NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"value\":\"2\""),
+           "two cookies in one header -> second one read", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=ctok", "Cookie: ctok=a=b\r\n", NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"value\":\"a=b\""),
+           "cookie value containing '=' read in full", code);
+
+    printf("\n=== [%s] UNIT: cookies - invalid data ===\n", tag());
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=ctok", "Cookie: ctok\r\n", NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"found\":false"),
+           "Cookie pair without '=' handled (not found)", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=ctok", "Cookie: =cv42\r\n", NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"found\":false"),
+           "Cookie with empty name handled (not found)", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/get?name=ctok", "Cookie: ;;; ; \r\n", NULL, 0, buf, (int)sizeof(buf));
+    report(code == 200 && strstr(buf, "\"found\":false"),
+           "garbage Cookie header handled (not found)", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/set?name=&value=x", NULL, NULL, 0, buf, (int)sizeof(buf));
+    report(code == 400, "set cookie with empty name -> 400", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/set?name=a%3Bb&value=x", NULL, NULL, 0, buf, (int)sizeof(buf));
+    report(code == 400, "set cookie with ';' in name -> 400", code);
+
+    code = do_request(g_is_https, "GET", "/api/cookie/set?name=ctok&value=a%3Bb", NULL, NULL, 0, buf, (int)sizeof(buf));
+    report(code == 400, "set cookie with ';' in value -> 400", code);
+
+    {
+        /* 9KB Cookie header: exceeds MAX_HEADER_SIZE (8192) -> 431 */
+        char extra[9300];
+        int off = (int)snprintf(extra, sizeof(extra), "Cookie: huge=");
+        memset(extra + off, 'a', 9000);
+        off += 9000;
+        extra[off++] = '\r'; extra[off++] = '\n';
+        code = do_request(g_is_https, "GET", "/", extra, NULL, 0, buf, (int)sizeof(buf));
+        report(code == 431, "9KB Cookie header -> 431 (header limit)", code);
+    }
+}
+
 static int build_multipart(char *out, int outsz, const char *boundary,
                            const char *field1, const char *filedata, size_t filelen,
                            const char *filename) {
@@ -1174,6 +1245,7 @@ static void run_unit_tests(void) {
     test_body_limits();
     if (g_is_web) {
         test_web_api();
+        test_web_cookies();
         test_web_forms_upload();
         test_web_websocket();
         test_web_sse();

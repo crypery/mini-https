@@ -22,51 +22,12 @@
 #include <stdbool.h>
 #include <time.h>
 
-/* --- WebSocket log broadcast --- */
-
-#define WS_MAX_CLIENTS 256
-
-/* Connected WebSocket client contexts (guarded by g_ws_lock) */
-static http_ctx_t *g_ws_clients[WS_MAX_CLIENTS];
-static int g_ws_count = 0;
-static mtx_t g_ws_lock;
-
-/* Register a connected WebSocket client */
-static void ws_register(http_ctx_t *c) {
-    mtx_lock(&g_ws_lock);
-    if (g_ws_count < WS_MAX_CLIENTS) g_ws_clients[g_ws_count++] = c;
-    mtx_unlock(&g_ws_lock);
-}
-
-/* Remove a disconnected WebSocket client */
-static void ws_unregister(http_ctx_t *c) {
-    mtx_lock(&g_ws_lock);
-    for (int i = 0; i < g_ws_count; i++) {
-        if (g_ws_clients[i] == c) {
-            g_ws_clients[i] = g_ws_clients[g_ws_count - 1];
-            g_ws_count--;
-            break;
-        }
-    }
-    mtx_unlock(&g_ws_lock);
-}
-
-/* Broadcast a log line to all connected WebSocket clients */
-static void ws_log_broadcast(const char *msg) {
-    mtx_lock(&g_ws_lock);
-    for (int i = 0; i < g_ws_count; i++) {
-        http_ws_send_text(g_ws_clients[i], msg);
-    }
-    mtx_unlock(&g_ws_lock);
-}
-
 /* --- Default config written when config.json is missing --- */
 
 static const char *sett_default =
     "{"
     "    \"ssl_use\": true,\n"
     "    \"port\": 81,\n"
-    "    \"root\": \"www\",\n"
     "    \"upload_dir\": \"www/upload\",\n"
     "    \"cert_file\": \"localhost.crt\",\n"
     "    \"key_file\": \"localhost.key\",\n"
@@ -82,7 +43,10 @@ static const char *sett_default =
     "    \"log_output\": 2,\n"
     "    \"log_level\": 3,\n"
     "    \"server_name\": \"nginx/1.25.2\",\n"
-    "    \"domains\": \"localhost,127.0.0.1\",\n"
+    "    \"domains\": {\n"
+    "        \"localhost\": \"www\",\n"
+    "        \"127.0.0.1\": \"www\"\n"
+    "    },\n"
     "    \"www_redirect\": true\n"
     "}\n";
 
@@ -154,9 +118,6 @@ int main(void) {
     http->log_level = sett_get_int(sett, "log_level", LOG_LEVEL_ERROR);
     if (http->log_level < LOG_LEVEL_DEBUG || http->log_level > LOG_LEVEL_ERROR) { LOG_ERROR("[err] log_level failed\n"); return 1; }
 
-    http->root = sett_get_string(sett, "root", "www");
-    if (!http->root || strlen(http->root)==0) { LOG_ERROR("[err] root failed\n"); return 1; }
-
     http->cert_file = sett_get_string(sett, "cert_file", "localhost.crt");
     if (!http->cert_file || strlen(http->cert_file)==0) { LOG_ERROR("[err] cert_file failed\n"); return 1; }
 
@@ -169,16 +130,31 @@ int main(void) {
     http->server_name = sett_get_string(sett, "server_name", DEF_SERVER_NAME);
     if (!http->server_name || strlen(http->server_name)==0) { LOG_ERROR("[err] server_name failed\n"); return 1; }
 
-    http->domains = sett_get_string(sett, "domains", DEF_DOMAINS);
-    if (!http->domains || strlen(http->domains)==0) { LOG_ERROR("[err] domains failed\n"); return 1; }
+    /* Domains: a JSON object mapping "domain" -> "root path" (per-domain
+     * document roots). Logging is not initialized yet here, so errors go
+     * straight to stderr. */
+    {
+        JsonValue *dv = sett_get_json(sett, "domains");
+        if (!json_is_object(dv)) { fprintf(stderr, "[err] domains failed (expected an object: \"domain\": \"root path\")\n"); return 1; }
+        for (int i = 0; i < dv->count; i++) {
+            JsonValue *v = dv->children[i];
+            if (!dv->keys[i] || !json_is_string(v) || !json_string(v)[0]) {
+                fprintf(stderr, "[err] domains failed (\"%s\" root is not a non-empty string)\n", dv->keys[i] ? dv->keys[i] : "?");
+                return 1;
+            }
+            if (http_domain(http, dv->keys[i], json_string(v)) != 0) {
+                fprintf(stderr, "[err] domains failed (%s)\n", dv->keys[i]);
+                return 1;
+            }
+        }
+        if (http->domain_count == 0) { fprintf(stderr, "[err] domains failed (empty)\n"); return 1; }
+    }
 
     http->www_redirect = sett_get_bool(sett, "www_redirect", true) ? 1 : 0;
 
     log_init(http->log_output, http->log_level, http->log_file);
-    log_set_callback(ws_log_broadcast);
-    mtx_init(&g_ws_lock);
-    LOG_INFO("[main] config loaded (port=%d, ssl=%d, root=%s, upload=%s, max_body_mb=%d)\n",
-             http->port, http->ssl_use, http->root, http->upload_dir, http->max_body_mb);
+    LOG_INFO("[main] config loaded (port=%d, ssl=%d, upload=%s, max_body_mb=%d, domains=%d)\n",
+             http->port, http->ssl_use, http->upload_dir, http->max_body_mb, http->domain_count);
 
     /* Start the server */
     if (http_run(http, http_log_cb) != 0) { LOG_ERROR("[err] http_run failed\n"); http_free(http); return 1; }
@@ -186,7 +162,6 @@ int main(void) {
     http_print_statistics(http);
 
     /* Clean up resources */
-    mtx_destroy(&g_ws_lock);
     http_free(http);
     log_close();
     sett_free(sett);

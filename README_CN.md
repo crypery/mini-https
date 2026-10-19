@@ -84,7 +84,6 @@ server-base.exe
 |---|---|---|
 | `ssl_use` | `true` | 启用 HTTPS（TLS） |
 | `port` | `443` | 监听端口 |
-| `root` | `www` | 静态文件根目录 |
 | `upload_dir` | `www/upload` | 上传文件保存目录 |
 | `cert_file` / `key_file` | `localhost.crt` / `localhost.key` | TLS 证书和密钥 |
 | `max_clients` | `256` | 最大并发客户端数 |
@@ -95,7 +94,7 @@ server-base.exe
 | `log_output` | `2` | 0 - 关闭，1 - 控制台+文件，2 - 控制台，3 - 文件 |
 | `log_level` | `3` | 0 - DEBUG，1 - INFO，2 - WARN，3 - ERROR |
 | `server_name` | `nginx/1.25.2` | `Server` 响应头的值 |
-| `domains` | `localhost,127.0.0.1` | 允许的域名 |
+| `domains` | `{"localhost":"www","127.0.0.1":"www"}` | 允许的域名，JSON 对象形式：`"域名": "根目录路径"` - 每个域名拥有自己的根目录 |
 | `www_redirect` | `true` | `true` - 将 `www.<域名>` 301 重定向到主域名（保持 scheme、端口和 URI）；`false` - 按常规方式处理 `www.` 主机 |
 
 ### 接口端点
@@ -110,9 +109,11 @@ server-base.exe
 | POST | `/api/echo` | 以 JSON 返回请求体 |
 | POST | `/api/upload` | 文件上传（multipart/form-data） |
 | POST | `/api/form` | 表单解析（urlencoded 或 multipart） |
-| GET | `/*` | `www/` 目录中的静态文件（`server-base.exe` 仅提供此项；以上 API/WS/SSE 适用于 `server.exe`） |
+| GET | `/*` | 请求域对应根目录中的静态文件（`server-base.exe` 仅提供此项；以上 API/WS/SSE 适用于 `server.exe`） |
 
 > `www` 重定向：当 `www_redirect: true`（默认）时，若请求的 `Host` 以 `www.` 开头且主域名在 `domains` 列表中，服务器返回 `301 Moved Permanently`，重定向到主域名的相同 scheme/端口/URI。
+
+> 按域名划分根目录：`domains` 对象将每个允许的 `Host` 映射到各自的根目录，例如 `"test.localhost": "test"` 会为 `Host: test.localhost` 提供 `test/` 目录，而 `localhost` 继续提供 `www/`。`Host` 不在 `domains` 列表中的请求将以 `400` 拒绝。API 路由也按域单独注册：服务器在循环中为 `config.json` 里的每个域注册路由（`http_route(http, domain, method, path, handler)`）。
 
 ### 示例
 

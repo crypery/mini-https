@@ -84,7 +84,6 @@ The server reads `config.json` from the current directory. If the file does not 
 |---|---|---|
 | `ssl_use` | `true` | Enable HTTPS (TLS) |
 | `port` | `443` | Listening port |
-| `root` | `www` | Root directory for static files |
 | `upload_dir` | `www/upload` | Directory for uploaded files |
 | `cert_file` / `key_file` | `localhost.crt` / `localhost.key` | TLS certificate and key |
 | `max_clients` | `256` | Maximum number of simultaneous clients |
@@ -95,7 +94,7 @@ The server reads `config.json` from the current directory. If the file does not 
 | `log_output` | `2` | 0 - off, 1 - console+file, 2 - console, 3 - file |
 | `log_level` | `3` | 0 - DEBUG, 1 - INFO, 2 - WARN, 3 - ERROR |
 | `server_name` | `nginx/1.25.2` | Value of the `Server` header |
-| `domains` | `localhost,127.0.0.1` | Allowed domains |
+| `domains` | `{"localhost":"www","127.0.0.1":"www"}` | Allowed domains as a JSON object: `"domain": "root path"` - each domain gets its own document root |
 | `www_redirect` | `true` | `true` - 301 redirect `www.<domain>` to the bare domain (scheme, port and URI are kept); `false` - serve `www.` hosts as usual |
 
 ### Endpoints
@@ -110,9 +109,11 @@ The server reads `config.json` from the current directory. If the file does not 
 | POST | `/api/echo` | Returns the request body as JSON |
 | POST | `/api/upload` | File upload (multipart/form-data) |
 | POST | `/api/form` | Form parsing (urlencoded or multipart) |
-| GET | `/*` | Static files from the `www/` directory (`server-base.exe` serves only this; API/WS/SSE rows above apply to `server.exe`) |
+| GET | `/*` | Static files from the request domain's document root (`server-base.exe` serves only this; API/WS/SSE rows above apply to `server.exe`) |
 
 > `www` redirect: with `www_redirect: true` (default), a request whose `Host` starts with `www.` and whose bare domain is listed in `domains` is answered with `301 Moved Permanently` to the same scheme/port/URI on the bare domain.
+
+> Per-domain roots: the `domains` object maps each allowed `Host` to its own document root, e.g. `"test.localhost": "test"` serves `test/` for `Host: test.localhost` while `localhost` keeps serving `www/`. Requests with a `Host` not present in `domains` are rejected with `400`. API routes are also registered per domain: the server registers the route set for every domain from `config.json` via `http_route(http, domain, method, path, handler)`.
 
 ### Examples
 
