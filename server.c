@@ -166,7 +166,8 @@ int handle_post_upload(http_server_t *http, http_ctx_t *c, const char *method, c
     (void)method; (void)uri;
     if (body_len == 0) { http_send_json_response(http, c, 400, "{\"error\":\"Empty body\"}"); return 1; }
     char *boundary = NULL;
-    const char *ct = http_get_content_type(http_req_buf(c));
+    char ct_buf[256];
+    const char *ct = http_get_content_type(http_req_buf(c), ct_buf, sizeof(ct_buf));
     if (ct && strstr(ct, "multipart/form-data")) {
         const char *bnd = strstr(ct, "boundary=");
         if (bnd) { bnd += 9; boundary = (char *)malloc(strlen(bnd) + 1); strcpy(boundary, bnd); }
@@ -315,7 +316,8 @@ int handle_get_params(http_server_t *http, http_ctx_t *c, const char *method, co
 int handle_post_form(http_server_t *http, http_ctx_t *c, const char *method, const char *uri, const char *body, size_t body_len) {
     (void)method; (void)uri;
     if (body_len == 0) { http_send_json_response(http, c, 400, "{\"error\":\"Empty body\"}"); return 1; }
-    const char *ct = http_get_content_type(http_req_buf(c));
+    char ct_buf[256];
+    const char *ct = http_get_content_type(http_req_buf(c), ct_buf, sizeof(ct_buf));
     if (ct && strstr(ct, "application/x-www-form-urlencoded")) {
         http_query_string_t qs;
         http_query_init(&qs);

@@ -7,7 +7,7 @@
 /*
  * compat.h - portability layer for the mini-c-server modules.
  *
- * Lets log, sett, server, and web_test compile and run on both
+ * Lets log, sett, server, and http_test compile and run on both
  * Windows (Winsock + WinAPI) and POSIX (Berkeley sockets + pthreads).
  *
  * On Windows the native APIs are used: SOCKET, WSA* errors, CRITICAL_SECTION,
@@ -148,11 +148,15 @@ static inline int thr_create(thr_t *t, thr_fn_t fn, void *arg) {
 static inline void thr_join(thr_t *t) { pthread_join(*t, NULL); }
 #endif
 
-/* --- auto-reset event (one pending wakeup) --- */
+/* --- manual-reset event (wakeup stays pending until evt_reset) ---
+ * Waiters must re-check the shared predicate and call evt_reset() only when
+ * going back to sleep; a plain evt_signal() per item would lose wakeups on
+ * bursts (several queued items, all waiters asleep). */
 #ifdef _WIN32
 typedef HANDLE evt_t;
-static inline void evt_init(evt_t *e)    { *e = CreateEvent(NULL, FALSE, FALSE, NULL); }
+static inline void evt_init(evt_t *e)    { *e = CreateEvent(NULL, TRUE, FALSE, NULL); }
 static inline void evt_signal(evt_t *e)  { SetEvent(*e); }
+static inline void evt_reset(evt_t *e)   { ResetEvent(*e); }
 static inline void evt_wait(evt_t *e)    { WaitForSingleObject(*e, INFINITE); }
 static inline void evt_destroy(evt_t *e) { CloseHandle(*e); }
 #else
@@ -165,13 +169,17 @@ static inline void evt_init(evt_t *e) {
 static inline void evt_signal(evt_t *e) {
     pthread_mutex_lock(&e->m);
     e->flag = 1;
-    pthread_cond_signal(&e->c);
+    pthread_cond_broadcast(&e->c);
+    pthread_mutex_unlock(&e->m);
+}
+static inline void evt_reset(evt_t *e) {
+    pthread_mutex_lock(&e->m);
+    e->flag = 0;
     pthread_mutex_unlock(&e->m);
 }
 static inline void evt_wait(evt_t *e) {
     pthread_mutex_lock(&e->m);
     while (!e->flag) pthread_cond_wait(&e->c, &e->m);
-    e->flag = 0;
     pthread_mutex_unlock(&e->m);
 }
 static inline void evt_destroy(evt_t *e) {

@@ -64,7 +64,7 @@ The script compiles the project and produces `server.exe` (full-featured server)
 build_test.bat
 ```
 
-The script builds `web_test.exe`, a test harness that runs unit and stress tests **against a running server** (see the `Testing (web_test.c)` section). Start `server.exe` / `server-base.exe` before running `web_test.exe`.
+The script builds `http_test.exe`, a test harness that runs unit, stress, and fuzz tests **against a running server** (see the `Testing (http_test.c)` section). Start `server.exe` / `server-base.exe` before running `http_test.exe`.
 
 ## Usage
 
@@ -138,9 +138,9 @@ curl -k -i -H "Host: www.localhost" https://127.0.0.1/
 :: -> HTTP/1.1 301 Moved Permanently, Location: https://localhost/
 ```
 
-## Testing (`web_test.c`)
+## Testing (`http_test.c`)
 
-`web_test.c` is a standalone test harness that runs **unit** and **stress** tests against a **running** server. It can target either `server-base.exe` (static only) or `server.exe` (static + API + WS + SSE + upload), over plain HTTP or TLS. Each check prints `[PASS]`/`[FAIL]` and the status code it received; a summary and a histogram of all response codes are printed at the end.
+`http_test.c` is a standalone test harness that runs **unit**, **stress**, and **fuzz** tests against a **running** server. It unifies the common tests (run against either server) and the `server.c` tests (run against the full-featured server): `base` targets `server-base.exe` (static only), `web` targets `server.exe` (static + API + WS + SSE + upload), over plain HTTP or TLS. Each check prints `[PASS]`/`[FAIL]` and the status code it received; a summary and a histogram of all response codes are printed at the end.
 
 The server must be started first, and the `base`/`web` and `http`/`https` arguments must match the server you started and its `config.json`:
 
@@ -150,34 +150,47 @@ server.exe            :: or server-base.exe
 
 :: 2. In another terminal - build and run the tests
 build_test.bat
-web_test.exe <base|web> <http|https> <host> <port> [unit|stress|all]
+http_test.exe <base|web> <http|https> <host> <port> [unit|stress|all]
 
 :: Examples
-web_test.exe base https 127.0.0.1 443 all     :: server-base, TLS, unit + stress
-web_test.exe web  https 127.0.0.1 443 unit    :: server,     TLS, unit only
-web_test.exe base http  127.0.0.1 8443 stress :: server-base, plain HTTP, stress only
+http_test.exe base https 127.0.0.1 443 all     :: server-base, TLS, unit + stress
+http_test.exe web  https 127.0.0.1 443 unit    :: server,     TLS, unit only
+http_test.exe base http  127.0.0.1 8443 stress :: server-base, plain HTTP, stress only
 ```
 
 ### Unit tests
 
+Common to both servers:
+
 - **Static files** - `GET /` and `GET /index.html` -> `200`, missing page -> `404`, `POST /` (body ignored) -> `200`
 - **gzip** - creates a pre-compressed `www/index.html.gz`, checks `Content-Encoding: gzip` and the `1f 8b` magic bytes, then removes it
-- **Error paths** - malformed request, `../` traversal -> `400`, blocked path (`config.json`) -> `403`, disallowed `Host` -> `400`, `www.` host -> `301` redirect, ~10 KB of headers -> `431`, 3 KB-long URI -> `414`/`404` (no crash)
+- **Error paths** - malformed request, `../` traversal -> `400`, blocked path (`config.json`) -> `403`, unknown subdomain `Host` -> `404`, malformed/empty `Host` -> `400`, `www.` host -> `301` redirect, ~10 KB of headers -> `431`, 3 KB-long URI -> `414`/`404` (no crash)
 - **Body limits** - `Content-Length: 300000000` -> `413` (hard cap), negative `Content-Length` handled
-- **Web API** *(server only)* - `GET /api/info` (JSON), `GET /api/hello?name=` (greeting) and missing `name` -> `400`, `GET /api/params` (parsed HTML), `POST /api/echo` (JSON echo)
-- **Forms and upload** *(server only)* - `POST /api/form` urlencoded and multipart; `POST /api/upload` multipart (file saved to `www/upload` and verified on disk), non-multipart upload -> `400`
-- **WebSocket** *(server only)* - `GET /ws` -> `101` with a correct `Sec-WebSocket-Accept` (checked with an independent SHA-1 + base64), text-frame echo, close frame
-- **SSE** *(server only)* - `GET /sse` -> `200` `text/event-stream` with `connected` + `tick` events
-- **No-API check** *(server-base only)* - `GET /api/info` and `POST /api/echo` -> `404`
+- **Request methods** - standard method routing (`GET`/`POST` routes answered, `PUT`/`DELETE`/`PATCH` fall through to static -> `404` on `/api/*`, `HEAD`/`OPTIONS` -> `200`, case-insensitive `get`), plus malformed-method fuzzing (empty method, no path, CR/NUL/control bytes inside, 16/100-char overlong methods, CONNECT authority form)
+- **Raw-request fuzzing** - junk `Cookie` headers (NUL/control bytes, no `=`, empty names, many semicolons, percent-escaped UTF-8, duplicate headers, embedded CRLF), `Host` garbage (609-char subdomain -> `404`, colons/spaces/empty -> `400`, duplicate `Host` - first wins), method-only and missing-version requests, ~8.6 KB headers -> `431`, 4 KB URI -> `404`, dot-dot and percent-encoded traversal -> `400`, absolute-form targets (`http://host/path` -> path, unknown host -> `404`), POST body without `Content-Length`, negative/huge `Content-Length`, NUL byte in the URI, and a health check after the storm
 - **TLS robustness** *(HTTPS only)* - invalid record type / version, ChangeCipherSpec-only, TLS alert, small app-data records, mixed valid/invalid records, >16 KB record, crafted ClientHello; plaintext request on a TLS port -> `426` or a clean close (all bounded, no pinned worker)
+
+`server.c` (web server) only:
+
+- **Web API** - `GET /api/info` (JSON), `GET /api/hello?name=` (greeting) and missing `name` -> `400`, `GET /api/params` (parsed HTML), `POST /api/echo` (JSON echo)
+- **Cookies** - `GET /api/cookie/set` -> `Set-Cookie` header, `GET /api/cookie/get` round-trip (found / not found, multiple cookies, `=` inside values), malformed `Cookie` headers handled, invalid cookie name/value -> `400`, 9 KB `Cookie` header -> `431`
+- **Forms and upload** - `POST /api/form` urlencoded and multipart; `POST /api/upload` multipart (file saved to `www/upload` and verified on disk), non-multipart upload -> `400`
+- **WebSocket** - `GET /ws` -> `101` with a correct `Sec-WebSocket-Accept` (checked with an independent SHA-1 + base64), text-frame echo, close frame
+- **SSE** - `GET /sse` -> `200` `text/event-stream` with `connected` + `tick` events
+
+`server-base` only:
+
+- **No-API check** - `GET /api/info` and `POST /api/echo` -> `404`; any method serves the static file
 
 ### Stress tests
 
+- **Burst** - 12 simultaneous requests (more than worker threads; pins the worker-pool wake-up regression)
 - **Rapid** - 30 sequential requests
 - **Concurrent** - 8 threads x 10 requests
 - **1 MB upload** - large body to `/api/upload` (server) or `/` (base)
-- **Idle + abort storm** - many idle and abruptly closed connections, then a health check (the server must stay responsive)
+- **Idle + abort storm** - many idle and abruptly closed (RST) connections, then a health check (the server must stay responsive)
 - **Slowloris trickle** - the request is sent 1 byte every 2 s so the header phase exceeds the server deadline; the server must answer `408` and free the worker
+- **Incomplete requests** - partial request, complete headers without the final `CRLF-CRLF`, and LF-only line endings: the server must terminate the connection in bounded time (clean close or an error status), never hang and never answer a false success
 
 ### Output
 
